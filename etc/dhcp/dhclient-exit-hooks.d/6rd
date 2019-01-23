@@ -1,0 +1,74 @@
+# Main configuration
+iface="i6"
+mtu="1472"
+ttl="64"
+prefix="64"
+sixrd_gateway="193.5.29.1"
+sixrd_prefix="2a02:1200::/28"
+
+# Path to an IP calculation script
+sixrd_script="/opt/scripts/sixrd.py"
+
+# Setup LAN interface?
+lan="yes"
+
+# LAN-specific config
+iface_lan="vlan2"
+use_radvd="yes"
+use_dhcpv6="yes"
+
+sixrd_down() {
+    ip tunnel del $iface > /dev/null 2>&1 || true
+    ip -6 addr flush $iface_lan scope global
+}
+
+sixrd_up() {
+    ipv4=${new_ip_address:-$old_ip_address}
+
+    # External interface
+    subnet_ext=$($sixrd_script $sixrd_prefix $ipv4 ext)
+    addr_ext=${subnet_ext}1
+
+    ip tunnel add $iface mode sit local $ipv4 ttl $ttl
+    ip tunnel 6rd dev $iface 6rd-prefix $sixrd_prefix
+    ip addr add ${addr_ext}/${prefix} dev $iface
+    ip link set mtu $mtu dev $iface
+    ip link set $iface up
+    ip -6 route add default via ::${sixrd_gateway} dev $iface
+
+    if [ "x$lan" != "xyes" ]; then
+	    exit
+    fi
+
+    # LAN interface
+    subnet_int=$($sixrd_script $sixrd_prefix $ipv4 int)
+    addr_int=${subnet_int}1
+
+    ip -6 addr add ${addr_int}/${prefix} dev $iface_lan
+
+    if [ "x$use_radvd" = "xyes" ]; then
+        sed "s/###LAN_IF###/${iface_lan}/g; s/###MTU###/${mtu}/g; s/###DNS###/${addr_int}/g" /etc/radvd.conf.tpl > /etc/radvd.conf
+        [ -e /var/run/radvd/radvd.pid ] && [ -e /proc/`cat /var/run/radvd/radvd.pid` ] && systemctl reload radvd
+    fi
+
+    if [ "x$use_dhcpv6" = "xyes" ]; then
+        sed "s/###SUBNET###/${subnet_int}/g; s/###PREFIX###/${prefix}/g; s/###DNS###/${addr_int}/g" /etc/dhcp/dhcpd6.conf.tpl > /etc/dhcp/dhcpd6.conf
+        [ -e /run/dhcp-server/dhcpd6.pid ] && [ -e /proc/`cat /run/dhcp-server/dhcpd6.pid` ] && systemctl restart isc-dhcp-server6
+    fi
+}
+
+case $reason in
+    BOUND|REBOOT)
+        sixrd_down
+        sixrd_up
+        ;;
+    RENEW|REBIND)
+        if [ "$new_ip_address" != "$old_ip_address" ]; then
+            sixrd_down
+            sixrd_up
+        fi
+        ;;
+    STOP|EXPIRE|FAIL|RELEASE)
+        sixrd_down
+        ;;
+esac
